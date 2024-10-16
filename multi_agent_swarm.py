@@ -6,6 +6,8 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from exa_py import Exa
+import json
 
 load_dotenv()  # This loads the variables from .env
 
@@ -14,6 +16,9 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize the Swarm client with the OpenAI client
 client = Swarm(client=openai_client)
+
+# Initialize the Exa client
+exa_client = Exa(api_key=os.getenv("EXA_API_KEY"))
 
 def transfer_to_executor(enhanced_prompt):
     print(f"\nEnhancer Agent output:\n{enhanced_prompt}")
@@ -31,35 +36,36 @@ def transfer_to_enhancer(checked_response):
     print(f"\nChecker Agent output:\n{checked_response}")
     return enhancer_agent, {"response": checked_response}
 
+def search_internet(query, num_results=5):
+    results = exa_client.search(query, num_results=num_results)
+    formatted_results = []
+    for result in results:
+        formatted_results.append(f"Title: {result.title}\nURL: {result.url}\nSnippet: {result.snippet}\n")
+    return "\n".join(formatted_results)
+
+def transfer_to_internet_search(query):
+    print(f"\nTransferring to Internet Search Agent with query:\n{query}")
+    return internet_search_agent, {"query": query}
+
 enhancer_agent = Agent(
     name="Enhancer",
     instructions="""You are an agent that enhances user prompts. Your task is to:
     1. Reword the user's input to be more clear, specific, and thorough.
-    2. Prepend the following instructions to the enhanced prompt:
+    2. Determine if the query requires internet search or not.
+    3. If internet search is required, call the transfer_to_internet_search function with the enhanced query.
+    4. If not, return the enhanced prompt with the following instructions prepended:
 
     [Instructions for the next agent:
     1. Begin by enclosing all thoughts within <thinking> tags, exploring multiple angles and approaches.
     2. Break down the solution into clear steps within <step> tags.
-    3. Start with a 20-step budget, requesting more for complex problems if needed.
-    4. Use <count> tags after each step to show the remaining budget. Stop when reaching 0.
-    5. Continuously adjust your reasoning based on intermediate results and reflections, adapting your strategy as you progress.
-    6. Regularly evaluate progress using <reflection> tags. Be critical and honest about your reasoning process.
-    7. Assign a quality score between 0.0 and 1.0 using <reward> tags after each reflection.
-    8. Use the reward score to guide your approach:
-       - 0.8+: Continue current approach
-       - 0.5-0.7: Consider minor adjustments
-       - Below 0.5: Seriously consider backtracking and trying a different approach
-    9. If unsure or if reward score is low, backtrack and try a different approach, explaining your decision within <thinking> tags.
-    10. For mathematical problems, show all work explicitly using LaTeX for formal notation and provide detailed proofs.
-    11. Explore multiple solutions individually if possible, comparing approaches in reflections.
-    12. Use thoughts as a scratchpad, writing out all calculations and reasoning explicitly.
-    13. Synthesize the final answer within <answer> tags, providing a clear, concise summary.
-    14. Conclude with a final reflection on the overall solution, discussing effectiveness, challenges, and solutions.
-    15. Assign a final reward score.]
+    3. Use <count> tags after each step to show the remaining budget. Stop when reaching 0.
+    4. Continuously adjust your reasoning based on intermediate results and reflections.
+    5. Regularly evaluate progress using <reflection> tags.
+    6. Synthesize the final answer within <answer> tags, providing a clear, concise summary.
+    7. Conclude with a final reflection on the overall solution.]
 
-    3. Ensure these instructions are clearly separated from the enhanced user prompt.
-    Do not answer the prompt yourself, only enhance it and add the instructions.""",
-    functions=[transfer_to_executor],
+    Ensure these instructions are clearly separated from the enhanced user prompt.""",
+    functions=[transfer_to_executor, transfer_to_internet_search],
 )
 
 clarifier_agent = Agent(
@@ -70,7 +76,7 @@ clarifier_agent = Agent(
 
 executor_agent = Agent(
     name="Executor",
-    instructions="You are an agent that executes clarified prompts. Provide a detailed, well-thought-out response to the clarified question or request.",
+    instructions="You are an agent that executes enhanced prompts. Provide a detailed, well-thought-out response to the enhanced question or request.",
     functions=[transfer_to_planner],
 )
 
@@ -86,6 +92,12 @@ planner_agent = Agent(
     functions=[],
 )
 
+internet_search_agent = Agent(
+    name="Internet Search",
+    instructions="You are an agent that searches the internet for relevant information. Use the search_internet function to find information, then summarize and present the findings. Always include the source URLs in your response.",
+    functions=[search_internet, transfer_to_executor],
+)
+
 if __name__ == "__main__":
     console = Console()
     console.print(Panel("Starting Multi-Agent Swarm. Type 'exit' to quit.", style="bold green"))
@@ -98,11 +110,31 @@ if __name__ == "__main__":
 
         # Enhancer Agent
         enhanced_response = client.run(enhancer_agent, messages=[{"role": "user", "content": user_input}])
-        enhanced_prompt = enhanced_response.messages[-1]["content"]
-        console.print(Panel(f"[bold green]Enhanced Prompt:[/bold green]\n{enhanced_prompt}", border_style="green"))
+        if enhanced_response.messages:
+            last_message = enhanced_response.messages[-1]
+            function_call = last_message.get("function_call")
+            if function_call and isinstance(function_call, dict) and function_call.get("name") == "transfer_to_internet_search":
+                # Internet Search Agent
+                search_query = function_call.get("arguments", {}).get("query", user_input)
+                search_response = client.run(internet_search_agent, messages=[{"role": "user", "content": search_query}])
+                search_results = search_response.messages[-1]["content"] if search_response.messages else "No search results."
+                console.print(Panel(f"[bold blue]Internet Search Results:[/bold blue]\n{search_results}", border_style="blue"))
+                
+                # Pass search results to Executor Agent
+                executed_response = client.run(executor_agent, messages=[
+                    {"role": "user", "content": user_input},
+                    {"role": "assistant", "content": f"Based on the internet search, here are the results:\n\n{search_results}\n\nPlease provide a detailed response to the user's query using this information."}
+                ])
+            else:
+                enhanced_prompt = last_message.get("content", user_input)
+                console.print(Panel(f"[bold green]Enhanced Prompt:[/bold green]\n{enhanced_prompt}", border_style="green"))
+                
+                # Executor Agent
+                executed_response = client.run(executor_agent, messages=[{"role": "user", "content": enhanced_prompt}])
+        else:
+            console.print(Panel("[bold red]Error: Enhancer Agent returned no response.[/bold red]", border_style="red"))
+            continue
 
-        # Executor Agent
-        executed_response = client.run(executor_agent, messages=[{"role": "user", "content": enhanced_prompt}])
         executed_output = executed_response.messages[-1]["content"]
         console.print(Panel(f"[bold yellow]Executor Response:[/bold yellow]\n{executed_output}", border_style="yellow"))
 
